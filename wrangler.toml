@@ -2,10 +2,3 @@ name = "skill-evolver"
 main = "src/worker.ts"
 compatibility_date = "2024-01-01"
 account_id = "049ff5e84ecf636b53b162cbb580aae6"
-
-[[kv_namespaces]]
-binding = "EVOLVER_KV"
-id = "fe58473cf86b474fb0b9a1ee45822ad4"
-
-[vars]
-API_ENDPOINT = "https://skill-evolver.casey-digennaro.workers.dev"

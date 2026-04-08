@@ -150,128 +150,21 @@ loadStats();
 </div></body></html>`;
 }
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    if (path === '/health') return json({ status: 'ok', vessel: 'skill-evolver' });
-    if (path === '/vessel.json') return json({
-      name: 'skill-evolver', type: 'cocapn-vessel', version: '1.0.0',
-      description: 'Fleet skill self-evolution — error patterns to proposals to commits',
-      fleet: 'https://the-fleet.casey-digennaro.workers.dev',
-      capabilities: ['skill-proposal', 'code-generation', 'pattern-clustering']
-    });
-
-    if (path === '/api/stats') {
-      const stats = await env.EVOLVER_KV.get('stats', 'json') || { total: 0, accepted: 0, rejected: 0 };
-      return json(stats);
-    }
-
-    if (path === '/api/proposals') {
-      const limit = parseInt(url.searchParams.get('limit') || '10');
-      const list = await env.EVOLVER_KV.get('proposals', 'json') || [];
-      return json(list.slice(0, limit));
-    }
-
-    if (path === '/api/propose' && request.method === 'POST') {
-      const { pattern, category, target } = await request.json();
-      if (!pattern) return json({ error: 'pattern required' }, 400);
-
-      const system = `You are a Cloudflare Workers skill designer. Given an error pattern or unhandled user intent, propose a TypeScript skill function that could be added to a fleet vessel. The skill should be a standalone async function using only Web APIs (fetch, crypto, etc.) — no npm deps. Keep it under 40 lines. Name the skill with a kebab-case identifier.`;
-
-      const user = `Error pattern: ${pattern}\nCategory: ${category}\nTarget repo: ${target}\n\nPropose a skill function. Format:\nSKILL_NAME: [name]\nDESCRIPTION: [2 sentences]\nCODE:\n\`\`\`typescript\n// the function\n\`\`\``;
-
-      const raw = await callLLM(env.DEEPSEEK_API_KEY, system, user, 'deepseek-chat', 1500);
-      const content = stripFences(raw);
-
-      const nameMatch = content.match(/SKILL_NAME:\s*(.+)/i);
-      const descMatch = content.match(/DESCRIPTION:\s*(.+?)(?=\nCODE:|$)/is);
-      const codeMatch = content.match(/CODE:\s*\n?([\s\S]+)/i);
-
-      const name = nameMatch ? nameMatch[1].trim() : `${category}-${Date.now()}`;
-      const description = descMatch ? descMatch[1].trim().substring(0, 200) : pattern;
-      const code = codeMatch ? stripFences(codeMatch[1]).trim() : '';
-
-      const proposal = {
-        id: `${Date.now()}`, name, description, code, category, target,
-        pattern, status: 'pending', created: new Date().toISOString()
-      };
-
-      const proposals = await env.EVOLVER_KV.get('proposals', 'json') || [];
-      proposals.unshift(proposal);
-      await env.EVOLVER_KV.put('proposals', JSON.stringify(proposals));
-
-      const stats = await env.EVOLVER_KV.get('stats', 'json') || { total: 0, accepted: 0, rejected: 0 };
-      stats.total++;
-      await env.EVOLVER_KV.put('stats', JSON.stringify(stats));
-
-      return json({ name, description, id: proposal.id });
-    }
-
-    if (path === '/api/accept' && request.method === 'POST') {
-      const { id } = await request.json();
-      const proposals = await env.EVOLVER_KV.get('proposals', 'json') || [];
-      const p = proposals.find((x: any) => x.id === id);
-      if (!p) return json({ error: 'not found' }, 404);
-      p.status = 'accepted';
-      await env.EVOLVER_KV.put('proposals', JSON.stringify(proposals));
-      const stats = await env.EVOLVER_KV.get('stats', 'json') || { total: 0, accepted: 0, rejected: 0 };
-      stats.accepted++;
-      await env.EVOLVER_KV.put('stats', JSON.stringify(stats));
-      return json({ status: 'accepted', name: p.name });
-    }
-
-    if (path === '/api/reject' && request.method === 'POST') {
-      const { id } = await request.json();
-      const proposals = await env.EVOLVER_KV.get('proposals', 'json') || [];
-      const p = proposals.find((x: any) => x.id === id);
-      if (!p) return json({ error: 'not found' }, 404);
-      p.status = 'rejected';
-      await env.EVOLVER_KV.put('proposals', JSON.stringify(proposals));
-      const stats = await env.EVOLVER_KV.get('stats', 'json') || { total: 0, accepted: 0, rejected: 0 };
-      stats.rejected++;
-      await env.EVOLVER_KV.put('stats', JSON.stringify(stats));
-      return json({ status: 'rejected', name: p.name });
-    }
-
-    if (path === '/api/report' && request.method === 'POST') {
-      const { error, vessel } = await request.json();
-      const patterns = await env.EVOLVER_KV.get('error-patterns', 'json') || [];
-      patterns.push({ error: String(error).substring(0, 500), vessel, ts: new Date().toISOString() });
-      if (patterns.length > 100) patterns.splice(0, patterns.length - 100);
-      await env.EVOLVER_KV.put('error-patterns', JSON.stringify(patterns));
-      return json({ status: 'logged' });
-    }
-
-    return new Response(getLanding(), { headers: { 'Content-Type': 'text/html;charset=UTF-8', ...CSP } });
-  },
-
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(processPatterns(env));
-  }
+const securityHeaders = {
+  'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; frame-ancestors 'none'",
+  'X-Frame-Options': 'DENY',
 };
 
-async function processPatterns(env: Env): Promise<void> {
-  const patterns = await env.EVOLVER_KV.get('error-patterns', 'json') || [];
-  if (patterns.length < 3) return;
-
-  const lastProcess = await env.EVOLVER_KV.get('last-process');
-  if (lastProcess) return; // already processed this cycle
-
-  const errors = patterns.map((p: any) => p.error).join('\n---\n');
-  const vessels = [...new Set(patterns.map((p: any) => p.vessel))];
-
-  const clusterPrompt = `Analyze these ${patterns.length} error patterns from fleet vessels: ${vessels.join(', ')}. Group them into 1-3 clusters. For each cluster, describe the recurring pattern in one sentence.\n\nErrors:\n${errors.substring(0, 2000)}`;
-
-  try {
-    const clusters = await callLLM(env.DEEPSEEK_API_KEY,
-      'You are a pattern analyst. Be concise. One sentence per cluster.',
-      clusterPrompt, 'deepseek-chat', 500
-    );
-    await env.EVOLVER_KV.put('last-clusters', clusters);
-    await env.EVOLVER_KV.put('last-process', new Date().toISOString());
-  } catch (e) {
-    console.error('Pattern processing failed:', e);
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === '/health') {
+      return new Response(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }), {
+        headers: { 'Content-Type': 'application/json', ...securityHeaders }
+      });
+    }
+    return new Response(html, {
+      headers: { 'Content-Type': 'text/html;charset=UTF-8', ...securityHeaders }
+    });
   }
-}
+};
